@@ -4,6 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import sys
+from pathlib import Path
+from librosa.filters import mel as librosa_mel_fn
 from nsf_hifigan.nvSTFT import STFT
 from nsf_hifigan.models import load_model,load_config
 from torchaudio.transforms import Resample
@@ -69,6 +72,8 @@ class Vocoder:
             self.vocoder = NsfHifiGAN(vocoder_ckpt, device = device)
         elif vocoder_type == 'nsf-hifigan-log10':
             self.vocoder = NsfHifiGANLog10(vocoder_ckpt, device = device)
+        elif vocoder_type == 'nsf-bridgevoc':
+            self.vocoder = NsfBridgeVoC(vocoder_ckpt, device = device, infer_steps=8)
         else:
             raise ValueError(f" [x] Unknown vocoder: {vocoder_type}")
             
@@ -148,6 +153,150 @@ class NsfHifiGANLog10(NsfHifiGAN):
             c = 0.434294 * mel.transpose(1, 2)
             audio = self.model(c, f0)
             return audio
+
+
+class NsfBridgeVoC(torch.nn.Module):
+    def __init__(self, ckpt_path, device=None, infer_steps=8):
+        super().__init__()
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = torch.device(device)
+        self.ckpt_path = ckpt_path
+        self.infer_steps = infer_steps
+
+        repo_root = Path(__file__).resolve().parents[1]
+        bridge_root = repo_root / 'nsf_bridgevoc'
+        if bridge_root.exists():
+            bridge_root_str = str(bridge_root)
+            if bridge_root_str not in sys.path:
+                sys.path.insert(0, bridge_root_str)
+        else:
+            raise FileNotFoundError(f'nsf_bridgevoc folder not found at {bridge_root}')
+
+        from nsf_bridgevoc.inference import load_bridgevoc_inference
+
+        self.model = load_bridgevoc_inference(ckpt_path, infer_steps=infer_steps)
+        self.model_device = torch.device('cpu')
+        self.model.eval()
+
+        self.sampling_rate = int(self.model.sampling_rate)
+        self.n_fft = int(self.model.n_fft)
+        self.win_size = int(self.model.win_size)
+        self.hop_size_val = int(self.model.hop_size)
+        self.num_mels = int(self.model.num_mels)
+        self.fmin = float(self.model.fmin)
+        self.fmax = float(self.model.fmax)
+        self.drop_last_freq = bool(getattr(self.model, 'drop_last_freq', False))
+
+        self.mel_basis = {}
+        self.hann_window = {}
+        self.istft_window = None
+
+        self.h = DotDict({'pc_aug': False})
+
+    def _ensure_model_on_device(self):
+        if self.model_device != self.device:
+            self.model.to(self.device)
+            self.model.eval()
+            self.model.sde.N = int(self.infer_steps)
+            self.model_device = self.device
+        if self.istft_window is None or self.istft_window.device != self.device:
+            self.istft_window = torch.hann_window(self.win_size, device=self.device)
+
+    def sample_rate(self):
+        return self.sampling_rate
+
+    def hop_size(self):
+        return self.hop_size_val
+
+    def dimension(self):
+        return self.num_mels
+
+    def extract(self, audio, keyshift=0):
+        sampling_rate = self.sampling_rate
+        n_mels = self.num_mels
+        n_fft = self.n_fft
+        win_size = self.win_size
+        hop_length = self.hop_size_val
+        fmin = self.fmin
+        fmax = self.fmax
+        clip_val = 1e-5
+
+        factor = 2 ** (keyshift / 12)
+        n_fft_new = int(np.round(n_fft * factor))
+        win_size_new = int(np.round(win_size * factor))
+        hop_length_new = hop_length
+
+        mel_basis_key = str(fmax) + '_' + str(audio.device)
+        if mel_basis_key not in self.mel_basis:
+            mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax)
+            self.mel_basis[mel_basis_key] = torch.from_numpy(mel).float().to(audio.device)
+
+        keyshift_key = str(keyshift) + '_' + str(audio.device)
+        if keyshift_key not in self.hann_window:
+            self.hann_window[keyshift_key] = torch.hann_window(win_size_new).to(audio.device)
+
+        pad_left = (win_size_new - hop_length_new) // 2
+        pad_right = max((win_size_new - hop_length_new + 1) // 2, win_size_new - audio.size(-1) - pad_left)
+        mode = 'reflect' if pad_right < audio.size(-1) else 'constant'
+        y = torch.nn.functional.pad(audio.unsqueeze(1), (pad_left, pad_right), mode=mode).squeeze(1)
+
+        spec = torch.stft(
+            y,
+            n_fft_new,
+            hop_length=hop_length_new,
+            win_length=win_size_new,
+            window=self.hann_window[keyshift_key],
+            center=False,
+            pad_mode='reflect',
+            normalized=False,
+            onesided=True,
+            return_complex=True,
+        ).abs()
+
+        if keyshift != 0:
+            size = n_fft // 2 + 1
+            resize = spec.size(1)
+            if resize < size:
+                spec = F.pad(spec, (0, 0, 0, size - resize))
+            spec = spec[:, :size, :] * win_size / win_size_new
+
+        spec = torch.matmul(self.mel_basis[mel_basis_key], spec)
+        spec = torch.log(torch.clamp(spec, min=clip_val))
+        mel = spec.transpose(1, 2)
+        return mel
+
+    def forward(self, mel, f0):
+        self._ensure_model_on_device()
+        with torch.no_grad():
+            mel_t = mel.transpose(1, 2)
+            cond_full_ri = self.model.dnn.build_cond(mel_t, f0)
+            if self.drop_last_freq:
+                cond_full_ri = cond_full_ri[:, :, :-1].contiguous()
+
+            cond_complex = torch.complex(cond_full_ri[:, 0], cond_full_ri[:, 1])
+            cond_complex = self.model._spec_fwd(cond_complex)
+            cond = torch.stack([cond_complex.real, cond_complex.imag], dim=1)
+
+            sample_ri = self.model.sde.reverse_diffusion(cond, cond, self.model.dnn, to_cpu=False)
+
+            sample_complex = torch.complex(sample_ri[:, 0], sample_ri[:, 1])
+            if self.drop_last_freq:
+                last = sample_complex[:, -1:, :].contiguous()
+                sample_complex = torch.cat([sample_complex, last], dim=1)
+
+            spec = self.model._spec_back(sample_complex)
+            target_len = spec.shape[-1] * self.hop_size_val
+            wav = torch.istft(
+                spec,
+                n_fft=self.n_fft,
+                hop_length=self.hop_size_val,
+                win_length=self.win_size,
+                window=self.istft_window,
+                center=True,
+                length=target_len,
+            )
+            return wav.unsqueeze(1)
 
 
 class Unit2Wav(nn.Module):

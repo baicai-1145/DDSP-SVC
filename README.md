@@ -46,6 +46,16 @@ Then rename the checkpoint file and place it at the location specified by the 'v
 
 The 'config.json' of the vocoder needs to be at the same directory, for example, `pretrain/nsf_hifigan/config.json`.
 
+DDSP-SVC also supports NSF-BridgeVoC as an alternative diffusion vocoder. Put the checkpoint at `pretrain/nsf-bridgevoc/model.ckpt` and set in config:
+
+```yaml
+vocoder:
+  type: 'nsf-bridgevoc'
+  ckpt: 'pretrain/nsf-bridgevoc/model.ckpt'
+```
+
+NSF-BridgeVoC uses an internal reverse diffusion sampler (default NFE=8 steps in this repo). This repo loads the Lightning ckpt in inference-only mode, without depending on `pytorch_lightning`.
+
 - Pitch extractor:
 
 Download the pre-trained [RMVPE](https://github.com/yxlllc/RMVPE/releases/download/230917/rmvpe.zip) extractor and unzip it into `pretrain/` folder.

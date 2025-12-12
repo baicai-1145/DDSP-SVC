@@ -58,6 +58,16 @@ python 3.8 (windows) + cuda 11.8 + torch 2.4.1 + torchaudio 2.4.1 可以运行
 
 声码器的 'config.json' 需要在同目录，比如 `pretrain/nsf_hifigan/config.json`。
 
+本项目也支持 NSF-BridgeVoC 作为扩散声码器选项。将权重放到 `pretrain/nsf-bridgevoc/model.ckpt`，并在配置中设置：
+
+```yaml
+vocoder:
+  type: 'nsf-bridgevoc'
+  ckpt: 'pretrain/nsf-bridgevoc/model.ckpt'
+```
+
+NSF-BridgeVoC 在本仓库默认使用 8 步反向扩散采样；本仓库以“纯推理模式”直接读取 Lightning ckpt，不再依赖 `pytorch_lightning`。
+
 * 音高提取器:
 
 下载预训练 [RMVPE](https://github.com/yxlllc/RMVPE/releases/download/230917/rmvpe.zip) 提取器并解压至 `pretrain/` 文件夹
@@ -208,4 +218,3 @@ python gui_reflow.py
 * [Diff-SVC](https://github.com/prophesier/diff-svc)
 
 * [Diffusion-SVC](https://github.com/CNChTu/Diffusion-SVC)
-
